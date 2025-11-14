@@ -1,0 +1,181 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: ai-platform-db
+    environment:
+      POSTGRES_DB: ai_platform
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin123
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d ai_platform"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ai-platform-network
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: ai-platform-redis
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ai-platform-network
+
+  # RabbitMQ Message Queue
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: ai-platform-mq
+    environment:
+      RABBITMQ_DEFAULT_USER: admin
+      RABBITMQ_DEFAULT_PASS: admin123
+    ports:
+      - "5672:5672"   # AMQP
+      - "15672:15672" # Management UI
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ai-platform-network
+
+  # API Service (Node.js)
+  api-service:
+    build:
+      context: ./services/api-service
+      dockerfile: Dockerfile
+    container_name: ai-platform-api
+    environment:
+      NODE_ENV: development
+      PORT: 8080
+      DATABASE_URL: postgresql://admin:admin123@postgres:5432/ai_platform
+      REDIS_URL: redis://redis:6379
+      RABBITMQ_URL: amqp://admin:admin123@rabbitmq:5672
+      JWT_SECRET: your-secret-key-change-in-production
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    volumes:
+      - ./services/api-service:/app
+      - /app/node_modules
+    networks:
+      - ai-platform-network
+    restart: unless-stopped
+
+  # STT Worker (Python)
+  stt-worker:
+    build:
+      context: ./services/stt-worker
+      dockerfile: Dockerfile
+    container_name: ai-platform-stt-worker
+    environment:
+      PYTHONUNBUFFERED: 1
+      DATABASE_URL: postgresql://admin:admin123@postgres:5432/ai_platform
+      RABBITMQ_URL: amqp://admin:admin123@rabbitmq:5672
+      STT_QUEUE: stt-queue
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    volumes:
+      - ./services/stt-worker:/app
+    networks:
+      - ai-platform-network
+    restart: unless-stopped
+    deploy:
+      replicas: 2
+
+  # LLM Worker (Python)
+  llm-worker:
+    build:
+      context: ./services/llm-worker
+      dockerfile: Dockerfile
+    container_name: ai-platform-llm-worker
+    environment:
+      PYTHONUNBUFFERED: 1
+      DATABASE_URL: postgresql://admin:admin123@postgres:5432/ai_platform
+      RABBITMQ_URL: amqp://admin:admin123@rabbitmq:5672
+      LLM_QUEUE: llm-queue
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    volumes:
+      - ./services/llm-worker:/app
+    networks:
+      - ai-platform-network
+    restart: unless-stopped
+    deploy:
+      replicas: 2
+
+  # Prometheus (Metrics)
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: ai-platform-prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    networks:
+      - ai-platform-network
+
+  # Grafana (Visualization)
+  grafana:
+    image: grafana/grafana:latest
+    container_name: ai-platform-grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin123
+      GF_INSTALL_PLUGINS: grafana-piechart-panel
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana-datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml
+    depends_on:
+      - prometheus
+    networks:
+      - ai-platform-network
+
+networks:
+  ai-platform-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  rabbitmq_data:
+  prometheus_data:
+  grafana_data:
