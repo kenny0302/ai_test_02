@@ -324,6 +324,270 @@ docker-compose down -v
 docker-compose up -d
 ```
 
+## 🔧 故障排除 (Troubleshooting)
+
+### 服務無法啟動
+
+#### 問題: `docker-compose up` 失敗
+```bash
+# 1. 檢查 Docker 守護程序是否運行
+docker info
+
+# 2. 檢查端口是否被佔用
+netstat -tulpn | grep -E '(5432|6379|5672|8080|3000|9090|15672)'
+# macOS/Windows:
+lsof -i :8080  # 檢查特定端口
+
+# 3. 查看詳細錯誤日誌
+docker-compose logs [service-name]
+
+# 4. 重新構建服務
+docker-compose build --no-cache
+docker-compose up -d
+```
+
+#### 問題: .env 文件未找到
+```bash
+# 從範例創建 .env 文件
+cp .env.example .env
+
+# 編輯並更新密碼
+vim .env  # 或使用你偏好的編輯器
+
+# 使用 make 命令（推薦）
+make setup
+```
+
+### 資料庫連接錯誤
+
+#### 問題: `connection refused` 或資料庫無法連接
+```bash
+# 1. 檢查 PostgreSQL 是否健康
+docker-compose exec postgres pg_isready -U admin
+
+# 2. 查看 PostgreSQL 日誌
+docker-compose logs postgres
+
+# 3. 驗證連接字符串
+echo $DATABASE_URL
+
+# 4. 手動測試連接
+docker-compose exec postgres psql -U admin -d ai_platform -c "SELECT 1;"
+
+# 5. 重啟資料庫
+docker-compose restart postgres
+```
+
+#### 問題: 資料庫初始化失敗
+```bash
+# 1. 查看初始化日誌
+docker-compose logs postgres | grep -A 20 "init-db.sql"
+
+# 2. 刪除並重新創建資料庫
+docker-compose down postgres
+docker volume rm ai_test_02_postgres_data
+docker-compose up -d postgres
+
+# 3. 使用 make 命令重置資料庫
+make db-reset
+```
+
+### Worker 無法處理任務
+
+#### 問題: 任務卡在 "pending" 狀態
+```bash
+# 1. 檢查 Worker 是否運行
+docker-compose ps | grep worker
+
+# 2. 查看 Worker 日誌
+docker-compose logs stt-worker-1 stt-worker-2
+docker-compose logs llm-worker-1 llm-worker-2
+
+# 3. 檢查 RabbitMQ 佇列
+# 訪問 http://localhost:15672 (admin/admin123)
+# 查看佇列中的消息數和消費者數
+
+# 4. 檢查佇列深度（CLI）
+docker-compose exec rabbitmq rabbitmqctl list_queues
+
+# 5. 重啟 Workers
+docker-compose restart stt-worker-1 stt-worker-2 llm-worker-1 llm-worker-2
+```
+
+#### 問題: Workers 不斷重啟
+```bash
+# 1. 查看崩潰日誌
+docker-compose logs --tail=100 stt-worker-1
+
+# 2. 檢查資源使用
+docker stats
+
+# 3. 檢查依賴服務是否健康
+docker-compose exec postgres pg_isready
+docker-compose exec rabbitmq rabbitmq-diagnostics ping
+
+# 4. 增加啟動延遲（臨時解決方案）
+# 編輯 worker.py，增加 sleep 時間
+```
+
+### API 錯誤
+
+#### 問題: 502 Bad Gateway 或 API 無回應
+```bash
+# 1. 檢查 API 服務狀態
+docker-compose ps api-service
+
+# 2. 查看 API 日誌
+docker-compose logs -f api-service
+
+# 3. 健康檢查
+curl http://localhost:8080/health/live
+curl http://localhost:8080/health/ready
+
+# 4. 檢查依賴服務
+make health
+
+# 5. 重啟 API 服務
+docker-compose restart api-service
+```
+
+#### 問題: 429 Too Many Requests (限流)
+```bash
+# 調整限流設置
+# 編輯 .env 文件:
+RATE_LIMIT_MAX_REQUESTS=1000  # 增加限制
+
+# 重啟服務
+docker-compose restart api-service
+```
+
+### Redis 連接問題
+
+#### 問題: Redis connection refused
+```bash
+# 1. 檢查 Redis 是否運行
+docker-compose ps redis
+
+# 2. 測試 Redis 連接
+docker-compose exec redis redis-cli ping
+# 應該返回 "PONG"
+
+# 3. 查看 Redis 日誌
+docker-compose logs redis
+
+# 4. 重啟 Redis
+docker-compose restart redis
+```
+
+### RabbitMQ 問題
+
+#### 問題: RabbitMQ Management UI 無法訪問
+```bash
+# 1. 檢查端口映射
+docker-compose ps rabbitmq
+
+# 2. 檢查防火牆
+# Linux:
+sudo ufw status
+# macOS: 系統偏好設定 > 安全性與隱私 > 防火牆
+
+# 3. 使用 CLI 檢查
+docker-compose exec rabbitmq rabbitmqctl status
+
+# 4. 訪問 URL
+http://localhost:15672
+# 帳號: admin
+# 密碼: 查看 .env 中的 RABBITMQ_DEFAULT_PASS
+```
+
+### 記憶體/CPU 使用過高
+
+#### 問題: 系統資源不足
+```bash
+# 1. 查看資源使用
+docker stats
+
+# 2. 減少 Worker 副本數
+# 編輯 docker-compose.yml，減少 worker 數量
+
+# 3. 調整資源限制
+# 在 docker-compose.yml 中修改 deploy.resources.limits
+
+# 4. 清理未使用的資源
+docker system prune -a
+docker volume prune
+
+# 5. 增加 Docker Desktop 記憶體
+# Docker Desktop > Settings > Resources > Memory
+# 建議: 至少 4GB，推薦 8GB
+```
+
+### 日誌查看技巧
+
+```bash
+# 實時查看所有服務日誌
+make logs
+
+# 查看特定服務日誌
+make logs SERVICE=api-service
+
+# 查看最近 100 行日誌
+docker-compose logs --tail=100 api-service
+
+# 查看錯誤日誌
+docker-compose logs | grep -i error
+
+# 查看時間戳日誌
+docker-compose logs -t api-service
+
+# 導出日誌到文件
+docker-compose logs > logs.txt
+```
+
+### 常見錯誤訊息
+
+| 錯誤訊息 | 原因 | 解決方案 |
+|---------|-----|---------|
+| `ECONNREFUSED` | 服務未啟動或端口錯誤 | 檢查服務狀態，驗證端口配置 |
+| `EADDRINUSE` | 端口已被佔用 | 關閉佔用端口的程序或更改端口 |
+| `no space left on device` | 磁盤空間不足 | 清理 Docker 資源: `docker system prune -a` |
+| `connection timeout` | 網路問題或服務響應慢 | 增加超時時間，檢查網路連接 |
+| `permission denied` | 文件權限問題 | 修改文件權限: `chmod +x script.sh` |
+| `database "ai_platform" does not exist` | 資料庫未初始化 | 重啟 postgres: `make db-reset` |
+
+### 性能優化建議
+
+```bash
+# 1. 清理舊的容器和映像
+docker system prune -a --volumes
+
+# 2. 使用 BuildKit 加速構建
+export DOCKER_BUILDKIT=1
+docker-compose build
+
+# 3. 增加資料庫連接池
+# 編輯 services/api-service/index.js
+# 修改 Pool 的 max 值
+
+# 4. 啟用 Redis 持久化
+# 編輯 docker-compose.yml
+# 修改 redis command 參數
+
+# 5. 監控資源使用
+make health
+docker stats
+```
+
+### 需要進一步協助？
+
+如果以上解決方案無法解決問題:
+
+1. **查看完整日誌**: `docker-compose logs > debug.log`
+2. **檢查環境變數**: `docker-compose config`
+3. **驗證 Docker 版本**: `docker version && docker-compose version`
+4. **重新開始**: `make clean && make up`
+5. **提交 Issue**: 附上錯誤日誌和系統資訊
+
 ## 📖 完整架構文件
 
 請參閱 [ARCHITECTURE.md](ARCHITECTURE.md) 獲取完整的系統架構設計，包含:

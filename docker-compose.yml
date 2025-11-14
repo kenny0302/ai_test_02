@@ -6,21 +6,29 @@ services:
     image: postgres:15-alpine
     container_name: ai-platform-db
     environment:
-      POSTGRES_DB: ai_platform
-      POSTGRES_USER: admin
-      POSTGRES_PASSWORD: admin123
+      POSTGRES_DB: ${POSTGRES_DB:-ai_platform}
+      POSTGRES_USER: ${POSTGRES_USER:-admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dev_password_123}
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./init-db.sql:/docker-entrypoint-initdb.d/init.sql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U admin -d ai_platform"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-admin} -d ${POSTGRES_DB:-ai_platform}"]
       interval: 10s
       timeout: 5s
       retries: 5
     networks:
       - ai-platform-network
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
 
   # Redis Cache
   redis:
@@ -38,14 +46,22 @@ services:
       retries: 5
     networks:
       - ai-platform-network
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 256M
 
   # RabbitMQ Message Queue
   rabbitmq:
     image: rabbitmq:3-management-alpine
     container_name: ai-platform-mq
     environment:
-      RABBITMQ_DEFAULT_USER: admin
-      RABBITMQ_DEFAULT_PASS: admin123
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-admin}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-dev_password_123}
     ports:
       - "5672:5672"   # AMQP
       - "15672:15672" # Management UI
@@ -58,6 +74,14 @@ services:
       retries: 5
     networks:
       - ai-platform-network
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
 
   # API Service (Node.js)
   api-service:
@@ -66,12 +90,14 @@ services:
       dockerfile: Dockerfile
     container_name: ai-platform-api
     environment:
-      NODE_ENV: development
-      PORT: 8080
-      DATABASE_URL: postgresql://admin:admin123@postgres:5432/ai_platform
-      REDIS_URL: redis://redis:6379
-      RABBITMQ_URL: amqp://admin:admin123@rabbitmq:5672
-      JWT_SECRET: your-secret-key-change-in-production
+      NODE_ENV: ${NODE_ENV:-development}
+      PORT: ${PORT:-8080}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD:-dev_password_123}@postgres:5432/${POSTGRES_DB:-ai_platform}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      RABBITMQ_URL: amqp://${RABBITMQ_DEFAULT_USER:-admin}:${RABBITMQ_DEFAULT_PASS:-dev_password_123}@rabbitmq:5672
+      JWT_SECRET: ${JWT_SECRET:-dev-jwt-secret-not-for-production}
+      RATE_LIMIT_WINDOW_MS: ${RATE_LIMIT_WINDOW_MS:-900000}
+      RATE_LIMIT_MAX_REQUESTS: ${RATE_LIMIT_MAX_REQUESTS:-100}
     ports:
       - "8080:8080"
     depends_on:
@@ -87,18 +113,26 @@ services:
     networks:
       - ai-platform-network
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 256M
 
-  # STT Worker (Python)
-  stt-worker:
+  # STT Worker (Python) - Scaled to 2 replicas
+  stt-worker-1:
     build:
       context: ./services/stt-worker
       dockerfile: Dockerfile
-    container_name: ai-platform-stt-worker
     environment:
       PYTHONUNBUFFERED: 1
-      DATABASE_URL: postgresql://admin:admin123@postgres:5432/ai_platform
-      RABBITMQ_URL: amqp://admin:admin123@rabbitmq:5672
+      DATABASE_URL: postgresql://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD:-dev_password_123}@postgres:5432/${POSTGRES_DB:-ai_platform}
+      RABBITMQ_URL: amqp://${RABBITMQ_DEFAULT_USER:-admin}:${RABBITMQ_DEFAULT_PASS:-dev_password_123}@rabbitmq:5672
       STT_QUEUE: stt-queue
+      MAX_RETRIES: 3
     depends_on:
       postgres:
         condition: service_healthy
@@ -110,19 +144,54 @@ services:
       - ai-platform-network
     restart: unless-stopped
     deploy:
-      replicas: 2
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 256M
 
-  # LLM Worker (Python)
-  llm-worker:
+  stt-worker-2:
+    build:
+      context: ./services/stt-worker
+      dockerfile: Dockerfile
+    environment:
+      PYTHONUNBUFFERED: 1
+      DATABASE_URL: postgresql://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD:-dev_password_123}@postgres:5432/${POSTGRES_DB:-ai_platform}
+      RABBITMQ_URL: amqp://${RABBITMQ_DEFAULT_USER:-admin}:${RABBITMQ_DEFAULT_PASS:-dev_password_123}@rabbitmq:5672
+      STT_QUEUE: stt-queue
+      MAX_RETRIES: 3
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    volumes:
+      - ./services/stt-worker:/app
+    networks:
+      - ai-platform-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+
+  # LLM Worker (Python) - Scaled to 2 replicas
+  llm-worker-1:
     build:
       context: ./services/llm-worker
       dockerfile: Dockerfile
-    container_name: ai-platform-llm-worker
     environment:
       PYTHONUNBUFFERED: 1
-      DATABASE_URL: postgresql://admin:admin123@postgres:5432/ai_platform
-      RABBITMQ_URL: amqp://admin:admin123@rabbitmq:5672
+      DATABASE_URL: postgresql://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD:-dev_password_123}@postgres:5432/${POSTGRES_DB:-ai_platform}
+      RABBITMQ_URL: amqp://${RABBITMQ_DEFAULT_USER:-admin}:${RABBITMQ_DEFAULT_PASS:-dev_password_123}@rabbitmq:5672
       LLM_QUEUE: llm-queue
+      MAX_RETRIES: 3
     depends_on:
       postgres:
         condition: service_healthy
@@ -134,7 +203,42 @@ services:
       - ai-platform-network
     restart: unless-stopped
     deploy:
-      replicas: 2
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+
+  llm-worker-2:
+    build:
+      context: ./services/llm-worker
+      dockerfile: Dockerfile
+    environment:
+      PYTHONUNBUFFERED: 1
+      DATABASE_URL: postgresql://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD:-dev_password_123}@postgres:5432/${POSTGRES_DB:-ai_platform}
+      RABBITMQ_URL: amqp://${RABBITMQ_DEFAULT_USER:-admin}:${RABBITMQ_DEFAULT_PASS:-dev_password_123}@rabbitmq:5672
+      LLM_QUEUE: llm-queue
+      MAX_RETRIES: 3
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    volumes:
+      - ./services/llm-worker:/app
+    networks:
+      - ai-platform-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 256M
 
   # Prometheus (Metrics)
   prometheus:
@@ -143,6 +247,7 @@ services:
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=15d'
     ports:
       - "9090:9090"
     volumes:
@@ -150,14 +255,22 @@ services:
       - prometheus_data:/prometheus
     networks:
       - ai-platform-network
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 256M
 
   # Grafana (Visualization)
   grafana:
     image: grafana/grafana:latest
     container_name: ai-platform-grafana
     environment:
-      GF_SECURITY_ADMIN_USER: admin
-      GF_SECURITY_ADMIN_PASSWORD: admin123
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin123}
       GF_INSTALL_PLUGINS: grafana-piechart-panel
     ports:
       - "3000:3000"
@@ -168,6 +281,14 @@ services:
       - prometheus
     networks:
       - ai-platform-network
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+        reservations:
+          cpus: '0.25'
+          memory: 128M
 
 networks:
   ai-platform-network:
