@@ -2,6 +2,8 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
+const rateLimit = require('express-rate-limit');
+const { body, validationResult } = require('express-validator');
 const { Pool } = require('pg');
 const { createClient } = require('redis');
 const amqp = require('amqplib');
@@ -110,6 +112,52 @@ app.use((req, res, next) => {
   next();
 });
 
+// Rate limiting configuration
+const apiLimiter = rateLimit({
+  windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 15 * 60 * 1000, // 15 minutes
+  max: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS) || 100, // Max 100 requests per window
+  standardHeaders: true, // Return rate limit info in the `RateLimit-*` headers
+  legacyHeaders: false, // Disable the `X-RateLimit-*` headers
+  handler: (req, res) => {
+    logger.warn(`Rate limit exceeded for IP: ${req.ip}`);
+    res.status(429).json({
+      success: false,
+      error: 'Too many requests, please try again later.',
+      retryAfter: Math.ceil(req.rateLimit.resetTime / 1000)
+    });
+  },
+  skip: (req) => {
+    // Skip rate limiting for health checks
+    return req.path.startsWith('/health') || req.path === '/metrics';
+  }
+});
+
+// Stricter rate limit for task creation
+const createTaskLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 10, // Max 10 task creations per minute
+  message: {
+    success: false,
+    error: 'Too many task creation requests, please slow down.'
+  }
+});
+
+// Input validation middleware
+const validateRequest = (req, res, next) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({
+      success: false,
+      errors: errors.array().map(err => ({
+        field: err.path,
+        message: err.msg,
+        value: err.value
+      }))
+    });
+  }
+  next();
+};
+
 // Health check endpoints
 app.get('/health/live', (req, res) => {
   res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
@@ -167,6 +215,9 @@ app.get('/metrics', async (req, res) => {
   res.set('Content-Type', register.contentType);
   res.end(await register.metrics());
 });
+
+// Apply rate limiting to all API routes
+app.use('/api/v1', apiLimiter);
 
 // API Routes
 app.get('/api/v1/tasks', async (req, res) => {
@@ -267,7 +318,27 @@ app.get('/api/v1/tasks/:id', async (req, res) => {
   }
 });
 
-app.post('/api/v1/tasks', async (req, res) => {
+// Task creation validation rules
+const createTaskValidation = [
+  body('audio_url')
+    .optional()
+    .isURL()
+    .withMessage('audio_url must be a valid URL'),
+  body('audio_duration')
+    .optional()
+    .isInt({ min: 1, max: 7200 })
+    .withMessage('audio_duration must be between 1 and 7200 seconds'),
+  body('user_id')
+    .optional()
+    .isUUID()
+    .withMessage('user_id must be a valid UUID')
+];
+
+app.post('/api/v1/tasks',
+  createTaskLimiter,
+  createTaskValidation,
+  validateRequest,
+  async (req, res) => {
   const client = await db.connect();
 
   try {

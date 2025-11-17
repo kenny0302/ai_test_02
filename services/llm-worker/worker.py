@@ -71,6 +71,49 @@ def get_db_connection():
         raise
 
 
+def get_retry_count(task_id):
+    """Get current retry count for a task"""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT retry_count FROM tasks WHERE id = %s",
+                (task_id,)
+            )
+            result = cur.fetchone()
+            return result['retry_count'] if result else 0
+    except Exception as e:
+        logger.error(f"Failed to get retry count: {e}")
+        return 0
+    finally:
+        conn.close()
+
+
+def increment_retry_count(task_id):
+    """Increment retry count for a task"""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE tasks
+                   SET retry_count = retry_count + 1, updated_at = NOW()
+                   WHERE id = %s
+                   RETURNING retry_count""",
+                (task_id,)
+            )
+            result = cur.fetchone()
+            conn.commit()
+            new_count = result['retry_count'] if result else 0
+            logger.info(f"Task {task_id} retry count incremented to {new_count}")
+            return new_count
+    except Exception as e:
+        logger.error(f"Failed to increment retry count: {e}")
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def get_stt_result(task_id):
     """Get STT result from database"""
     conn = get_db_connection()
@@ -183,6 +226,8 @@ def mock_llm_processing(transcription):
 
 def process_message(ch, method, properties, body):
     """Process incoming message from LLM queue"""
+    task_id = None
+
     try:
         # Parse message
         message = json.loads(body)
@@ -220,17 +265,43 @@ def process_message(ch, method, properties, body):
         logger.info(f"✅ Task {task_id} LLM processing completed successfully")
 
     except Exception as e:
-        logger.error(f"❌ Error processing message: {e}")
+        logger.error(f"❌ Error processing task {task_id}: {e}")
 
-        try:
-            # Try to update task status to failed
-            if 'task_id' in locals():
-                update_task_status(task_id, 'failed', str(e))
-        except:
-            pass
+        if task_id:
+            try:
+                # Get current retry count
+                retry_count = get_retry_count(task_id)
+                logger.info(f"Task {task_id} retry count: {retry_count}/{MAX_RETRIES}")
 
-        # Reject message and requeue
-        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+                if retry_count >= MAX_RETRIES:
+                    # Max retries reached - permanently fail the task
+                    update_task_status(task_id, 'failed', f"Max retries ({MAX_RETRIES}) exceeded: {str(e)}")
+
+                    # Acknowledge message to remove from queue
+                    ch.basic_ack(delivery_tag=method.delivery_tag)
+
+                    logger.error(f"❌ Task {task_id} permanently failed after {retry_count} retries")
+                else:
+                    # Increment retry count
+                    new_count = increment_retry_count(task_id)
+
+                    # Calculate exponential backoff delay (for logging)
+                    delay = min(2 ** retry_count, 300)  # Max 5 minutes
+
+                    # Requeue the message for retry
+                    ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+
+                    logger.warning(f"⚠️  Task {task_id} will be retried (attempt {new_count}/{MAX_RETRIES})")
+                    logger.info(f"Suggested backoff delay: {delay} seconds")
+
+            except Exception as retry_error:
+                logger.error(f"Error handling retry logic: {retry_error}")
+                # In case of error, requeue anyway
+                ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+        else:
+            # If we don't have task_id, we can't properly handle retry
+            # Reject and requeue once
+            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
 
 
 def main():
