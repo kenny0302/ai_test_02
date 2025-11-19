@@ -27,6 +27,23 @@ RABBITMQ_URL = os.getenv('RABBITMQ_URL', 'amqp://admin:admin123@rabbitmq:5672')
 LLM_QUEUE = os.getenv('LLM_QUEUE', 'llm-queue')
 MAX_RETRIES = 3
 
+# LLM Service Configuration
+MOCK_LLM_SERVICE = os.getenv('MOCK_LLM_SERVICE', 'true').lower() in ('true', '1', 'yes')
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', '')
+OPENAI_MODEL = os.getenv('OPENAI_MODEL', 'gpt-4')
+
+# Check OpenAI API configuration (using REST API instead of SDK to avoid conflicts)
+if not MOCK_LLM_SERVICE:
+    if OPENAI_API_KEY:
+        logger.info(f"✅ Real LLM Service enabled (OpenAI GPT via REST API)")
+        logger.info(f"🤖 Model: {OPENAI_MODEL}")
+    else:
+        logger.warning("⚠️  MOCK_LLM_SERVICE=false but no OPENAI_API_KEY provided")
+        logger.warning("Falling back to mock LLM service")
+        MOCK_LLM_SERVICE = True
+else:
+    logger.info("ℹ️  LLM Service: MOCK mode enabled")
+
 # Mock summaries
 MOCK_SUMMARIES = [
     {
@@ -194,10 +211,91 @@ def save_llm_result(task_id, summary, model_name, tokens_used, processing_time_m
         conn.close()
 
 
+def real_llm_processing(transcription):
+    """
+    Real LLM processing using OpenAI GPT API via HTTP REST
+    Uses requests library to avoid SDK dependency conflicts
+
+    Args:
+        transcription: The text to summarize
+
+    Returns:
+        dict: LLM result with summary, model_name, tokens_used, processing_time_ms
+    """
+    import requests
+    import json
+
+    start_time = time.time()
+
+    try:
+        logger.info(f"🤖 Starting OpenAI LLM summarization (model: {OPENAI_MODEL})")
+        logger.info(f"📝 Input length: {len(transcription)} characters")
+
+        # OpenAI Chat Completions API endpoint
+        url = "https://api.openai.com/v1/chat/completions"
+
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json"
+        }
+
+        payload = {
+            "model": OPENAI_MODEL,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant that creates concise summaries of transcribed audio. "
+                               "Provide a clear summary followed by 3-5 key points in bullet format."
+                },
+                {
+                    "role": "user",
+                    "content": f"Please summarize the following transcription:\n\n{transcription}"
+                }
+            ],
+            "temperature": 0.7,
+            "max_tokens": 500
+        }
+
+        # Make HTTP POST request
+        response = requests.post(url, headers=headers, json=payload, timeout=120)
+        response.raise_for_status()
+
+        processing_time = time.time() - start_time
+
+        # Parse JSON response
+        result = response.json()
+        summary = result['choices'][0]['message']['content']
+        tokens_used = result['usage']['total_tokens']
+        model_used = result['model']
+
+        logger.info(f"✅ OpenAI LLM completed in {processing_time:.2f}s")
+        logger.info(f"📊 Tokens used: {tokens_used}")
+        logger.info(f"🤖 Model: {model_used}")
+        logger.info(f"📄 Summary length: {len(summary)} characters")
+
+        return {
+            'summary': summary,
+            'model_name': model_used,
+            'tokens_used': tokens_used,
+            'processing_time_ms': int(processing_time * 1000)
+        }
+
+    except requests.exceptions.RequestException as e:
+        processing_time = time.time() - start_time
+        logger.error(f"❌ OpenAI LLM API HTTP error: {e}")
+        if hasattr(e.response, 'text'):
+            logger.error(f"Response: {e.response.text}")
+        raise
+    except Exception as e:
+        processing_time = time.time() - start_time
+        logger.error(f"❌ OpenAI LLM API error: {e}")
+        raise
+
+
 def mock_llm_processing(transcription):
     """
     Mock LLM processing
-    In production, this would call actual LLM API (GPT-4, Claude, Llama, etc.)
+    Simulates LLM processing without calling external APIs
     """
     # Simulate processing time (3-7 seconds)
     processing_time = random.uniform(3, 7)
@@ -209,7 +307,7 @@ def mock_llm_processing(transcription):
     # Calculate mock tokens
     tokens_used = len(transcription.split()) * 2  # Rough estimate
 
-    logger.info(f"Mock LLM processing completed in {processing_time:.2f}s")
+    logger.info(f"🎭 Mock LLM processing completed in {processing_time:.2f}s")
 
     # Create enhanced summary
     summary = f"{mock_result['summary']}\n\n**Key Points:**\n"
@@ -222,6 +320,25 @@ def mock_llm_processing(transcription):
         'tokens_used': tokens_used,
         'processing_time_ms': int(processing_time * 1000)
     }
+
+
+def perform_llm_processing(transcription):
+    """
+    Unified LLM processing entry point
+    Routes to real or mock LLM based on configuration
+
+    Args:
+        transcription: The text to summarize
+
+    Returns:
+        dict: LLM result with summary, model_name, tokens_used, processing_time_ms
+    """
+    if MOCK_LLM_SERVICE:
+        # Use mock LLM
+        return mock_llm_processing(transcription)
+    else:
+        # Use real LLM
+        return real_llm_processing(transcription)
 
 
 def process_message(ch, method, properties, body):
@@ -244,8 +361,8 @@ def process_message(ch, method, properties, body):
 
         logger.info(f"Retrieved transcription: {len(transcription)} characters")
 
-        # Perform LLM processing (mock)
-        llm_result = mock_llm_processing(transcription)
+        # Perform LLM processing (mock or real based on config)
+        llm_result = perform_llm_processing(transcription)
 
         # Save LLM result to database
         save_llm_result(

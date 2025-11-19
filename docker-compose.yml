@@ -65,8 +65,10 @@ services:
     ports:
       - "5672:5672"   # AMQP
       - "15672:15672" # Management UI
+      - "15692:15692" # Prometheus metrics
     volumes:
       - rabbitmq_data:/var/lib/rabbitmq
+      - ./monitoring/rabbitmq-enabled-plugins:/etc/rabbitmq/enabled_plugins
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "ping"]
       interval: 10s
@@ -98,6 +100,11 @@ services:
       JWT_SECRET: ${JWT_SECRET:-dev-jwt-secret-not-for-production}
       RATE_LIMIT_WINDOW_MS: ${RATE_LIMIT_WINDOW_MS:-900000}
       RATE_LIMIT_MAX_REQUESTS: ${RATE_LIMIT_MAX_REQUESTS:-100}
+      ENABLE_MINIO: ${ENABLE_MINIO:-false}
+      S3_ENDPOINT: ${S3_ENDPOINT:-http://minio:9000}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-admin123456}
     ports:
       - "8080:8080"
     depends_on:
@@ -133,6 +140,14 @@ services:
       RABBITMQ_URL: amqp://${RABBITMQ_DEFAULT_USER:-admin}:${RABBITMQ_DEFAULT_PASS:-dev_password_123}@rabbitmq:5672
       STT_QUEUE: stt-queue
       MAX_RETRIES: 3
+      ENABLE_MINIO: ${ENABLE_MINIO:-false}
+      S3_ENDPOINT: ${S3_ENDPOINT:-http://minio:9000}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-admin123456}
+      MOCK_STT_SERVICE: ${MOCK_STT_SERVICE:-true}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-whisper-1}
     depends_on:
       postgres:
         condition: service_healthy
@@ -162,6 +177,14 @@ services:
       RABBITMQ_URL: amqp://${RABBITMQ_DEFAULT_USER:-admin}:${RABBITMQ_DEFAULT_PASS:-dev_password_123}@rabbitmq:5672
       STT_QUEUE: stt-queue
       MAX_RETRIES: 3
+      ENABLE_MINIO: ${ENABLE_MINIO:-false}
+      S3_ENDPOINT: ${S3_ENDPOINT:-http://minio:9000}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-admin123456}
+      MOCK_STT_SERVICE: ${MOCK_STT_SERVICE:-true}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-whisper-1}
     depends_on:
       postgres:
         condition: service_healthy
@@ -192,6 +215,9 @@ services:
       RABBITMQ_URL: amqp://${RABBITMQ_DEFAULT_USER:-admin}:${RABBITMQ_DEFAULT_PASS:-dev_password_123}@rabbitmq:5672
       LLM_QUEUE: llm-queue
       MAX_RETRIES: 3
+      MOCK_LLM_SERVICE: ${MOCK_LLM_SERVICE:-true}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4}
     depends_on:
       postgres:
         condition: service_healthy
@@ -221,6 +247,9 @@ services:
       RABBITMQ_URL: amqp://${RABBITMQ_DEFAULT_USER:-admin}:${RABBITMQ_DEFAULT_PASS:-dev_password_123}@rabbitmq:5672
       LLM_QUEUE: llm-queue
       MAX_RETRIES: 3
+      MOCK_LLM_SERVICE: ${MOCK_LLM_SERVICE:-true}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4}
     depends_on:
       postgres:
         condition: service_healthy
@@ -277,6 +306,8 @@ services:
     volumes:
       - grafana_data:/var/lib/grafana
       - ./monitoring/grafana-datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml
+      - ./monitoring/grafana-dashboards.yml:/etc/grafana/provisioning/dashboards/dashboards.yml
+      - ./monitoring/ai-platform-dashboard-v2.json:/etc/grafana/provisioning/dashboards/ai-platform-dashboard-v2.json
     depends_on:
       - prometheus
     networks:
@@ -290,6 +321,39 @@ services:
           cpus: '0.25'
           memory: 128M
 
+  # MinIO (Mock S3 Storage) - Optional, controlled by ENABLE_MINIO env var
+  minio:
+    image: minio/minio:latest
+    container_name: ai-platform-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-admin123456}
+    ports:
+      - "9000:9000"   # API
+      - "9001:9001"   # Web Console
+    volumes:
+      - minio_data:/data
+      - ./uploads:/uploads
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ai-platform-network
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    profiles:
+      - minio
+      - full
+
 networks:
   ai-platform-network:
     driver: bridge
@@ -300,3 +364,4 @@ volumes:
   rabbitmq_data:
   prometheus_data:
   grafana_data:
+  minio_data:

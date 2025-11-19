@@ -14,27 +14,21 @@ ai_test_02/
 ├── README.md                          # 本文件
 ├── docker-compose.yml                 # Docker Compose 配置
 ├── init-db.sql                        # 資料庫初始化腳本
+├── demo.sh                            # 互動式 Demo 腳本
+├── integrated_demo.sh                 # 自動化 Demo 腳本
+├── harvard.wav                        # 測試音檔
 │
 ├── services/
 │   ├── api-service/                   # API 服務 (Node.js)
-│   │   ├── Dockerfile
-│   │   ├── package.json
-│   │   └── index.js
-│   │
 │   ├── stt-worker/                    # STT Worker (Python)
-│   │   ├── Dockerfile
-│   │   ├── requirements.txt
-│   │   └── worker.py
-│   │
 │   └── llm-worker/                    # LLM Worker (Python)
-│       ├── Dockerfile
-│       ├── requirements.txt
-│       └── worker.py
 │
 └── monitoring/                        # 監控配置
-    ├── prometheus.yml                 # Prometheus 配置
-    └── grafana-datasources.yml        # Grafana 資料源
+    ├── prometheus.yml
+    └── grafana-datasources.yml
 ```
+
+詳細架構設計請參閱 **[ARCHITECTURE.md](ARCHITECTURE.md)**
 
 ## 🚀 快速開始
 
@@ -46,30 +40,64 @@ ai_test_02/
 
 ### 啟動系統
 
-1. **克隆專案**
+有兩種啟動模式可選：
+
+#### 模式 1: 基本模式（不含 MinIO，預設）
+
+適合快速測試、開發環境。
+
 ```bash
+# 1. 克隆專案
 git clone <repository-url>
 cd ai_test_02
-```
 
-2. **啟動所有服務**
-```bash
+# 2. 啟動基本服務（不含 MinIO）
 docker-compose up -d
 ```
 
-3. **查看日誌**
+#### 模式 2: 完整模式（包含 MinIO）
+
+支援真實檔案上傳功能。
+
+```bash
+# 1. 克隆專案
+git clone <repository-url>
+cd ai_test_02
+
+# 2. 設定環境變數啟用 MinIO
+export ENABLE_MINIO=true
+
+# 3. 啟動所有服務（包含 MinIO）
+docker-compose --profile minio up -d
+```
+
+**初始化 MinIO bucket**（僅首次需要）:
+```bash
+docker exec ai-platform-minio mc alias set myminio http://localhost:9000 admin admin123456
+docker exec ai-platform-minio mc mb myminio/audio-files
+docker exec ai-platform-minio mc anonymous set download myminio/audio-files
+```
+
+### 運行 Demo
+
+```bash
+# 互動式 Demo（逐步展示各個功能）
+./demo.sh
+
+# 自動化 Demo（完整流程自動執行，包含 MinIO 上傳）
+./integrated_demo.sh
+```
+
+### 查看日誌與狀態
+
 ```bash
 # 查看所有服務日誌
 docker-compose logs -f
 
 # 查看特定服務日誌
 docker-compose logs -f api-service
-docker-compose logs -f stt-worker
-docker-compose logs -f llm-worker
-```
 
-4. **檢查服務狀態**
-```bash
+# 檢查服務狀態
 docker-compose ps
 ```
 
@@ -78,6 +106,8 @@ docker-compose ps
 | 服務 | URL | 說明 |
 |------|-----|------|
 | API Service | http://localhost:8080 | REST API 主服務 |
+| MinIO Console | http://localhost:9001 | 物件儲存管理介面 (admin/admin123456) |
+| MinIO API | http://localhost:9000 | S3 相容 API |
 | RabbitMQ Management | http://localhost:15672 | 訊息佇列管理介面 (admin/admin123) |
 | Prometheus | http://localhost:9090 | 指標收集與查詢 |
 | Grafana | http://localhost:3000 | 監控儀表板 (admin/admin123) |
@@ -96,16 +126,12 @@ curl http://localhost:8080/health/live
 curl http://localhost:8080/health/ready
 ```
 
-### 2. 創建任務
+### 2. 上傳音檔（新功能！）
 
 ```bash
-curl -X POST http://localhost:8080/api/v1/tasks \
-  -H "Content-Type: application/json" \
-  -d '{
-    "user_id": "00000000-0000-0000-0000-000000000001",
-    "audio_url": "https://example.com/audio/demo.mp3",
-    "audio_duration": 60
-  }'
+# 上傳音檔到 MinIO
+curl -X POST http://localhost:8080/api/v1/upload \
+  -F "audio=@path/to/your/audio.mp3"
 ```
 
 **回應範例**:
@@ -113,15 +139,35 @@ curl -X POST http://localhost:8080/api/v1/tasks \
 {
   "success": true,
   "data": {
-    "task_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
-    "status": "pending",
-    "status_url": "/api/v1/tasks/f47ac10b-58cc-4372-a567-0e02b2c3d479",
-    "estimated_completion_time": "2024-11-14T12:12:00.000Z"
+    "audio_url": "http://minio:9000/audio-files/audio/1234567890-audio.mp3",
+    "public_url": "http://localhost:9000/audio-files/audio/1234567890-audio.mp3",
+    "file_key": "audio/1234567890-audio.mp3",
+    "size": 1024567,
+    "mimetype": "audio/mpeg",
+    "original_name": "audio.mp3"
   }
 }
 ```
 
-### 3. 查詢任務狀態
+### 3. 創建任務（使用 MinIO 上傳的檔案）
+
+```bash
+# 先上傳檔案取得 audio_url
+UPLOAD_RESPONSE=$(curl -s -X POST http://localhost:8080/api/v1/upload \
+  -F "audio=@harvard.wav")
+AUDIO_URL=$(echo "$UPLOAD_RESPONSE" | jq -r '.data.audio_url')
+
+# 創建任務
+curl -X POST http://localhost:8080/api/v1/tasks \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"user_id\": \"00000000-0000-0000-0000-000000000001\",
+    \"audio_url\": \"$AUDIO_URL\",
+    \"audio_duration\": 30
+  }"
+```
+
+### 4. 查詢任務狀態
 
 ```bash
 # 替換 {task_id} 為實際的任務 ID
@@ -146,13 +192,13 @@ curl http://localhost:8080/api/v1/tasks/{task_id}
 }
 ```
 
-### 4. 列出所有任務
+### 5. 列出所有任務
 
 ```bash
 curl "http://localhost:8080/api/v1/tasks?user_id=00000000-0000-0000-0000-000000000001&limit=10"
 ```
 
-### 5. 查看統計資訊
+### 6. 查看統計資訊
 
 ```bash
 curl http://localhost:8080/api/v1/stats
@@ -210,56 +256,27 @@ histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m]))
 
 ### 核心組件
 
-1. **API Service (Node.js)**
-   - REST API 端點
-   - 任務建立與狀態管理
-   - 快取層 (Redis)
-   - 訊息發布 (RabbitMQ)
-
-2. **STT Worker (Python)**
-   - 從佇列消費 STT 任務
-   - Mock 語音轉文字處理
-   - 結果儲存與傳遞
-
-3. **LLM Worker (Python)**
-   - 從佇列消費 LLM 任務
-   - Mock 文字摘要處理
-   - 最終結果儲存
-
-4. **PostgreSQL**
-   - 任務狀態持久化
-   - STT 與 LLM 結果儲存
-   - 事務處理
-
-5. **Redis**
-   - 任務結果快取
-   - 限流計數器
-   - Session 管理
-
-6. **RabbitMQ**
-   - 非同步任務佇列
-   - 服務解耦
-   - 流量削峰
+1. **API Service (Node.js)** - REST API、任務管理、快取層、MinIO 上傳
+2. **STT Worker (Python)** - Mock 語音轉文字處理
+3. **LLM Worker (Python)** - Mock 文字摘要處理
+4. **PostgreSQL** - 任務狀態與結果持久化
+5. **Redis** - 結果快取與限流
+6. **RabbitMQ** - 非同步任務佇列
+7. **MinIO** - S3 相容物件儲存（可選）
 
 ### 處理流程
 
 ```
-使用者請求 → API Service → RabbitMQ (STT Queue)
-                ↓
-           PostgreSQL (任務記錄)
+使用者上傳 → MinIO (音檔儲存) → API Service → RabbitMQ (STT Queue)
+                                       ↓
+                                  PostgreSQL (任務記錄)
 
-STT Worker ← RabbitMQ (STT Queue)
-    ↓
-處理語音轉文字
-    ↓
-PostgreSQL (STT 結果) → RabbitMQ (LLM Queue)
+STT Worker ← RabbitMQ (STT Queue) → 處理語音轉文字 → PostgreSQL (STT 結果)
+                                                          ↓
+                                                   RabbitMQ (LLM Queue)
 
-LLM Worker ← RabbitMQ (LLM Queue)
-    ↓
-處理文字摘要
-    ↓
-PostgreSQL (LLM 結果) + Redis (快取)
-    ↓
+LLM Worker ← RabbitMQ (LLM Queue) → 處理文字摘要 → PostgreSQL + Redis (快取)
+                                                          ↓
 使用者查詢 ← API Service ← Redis/PostgreSQL
 ```
 

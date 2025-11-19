@@ -9,6 +9,10 @@ const { createClient } = require('redis');
 const amqp = require('amqplib');
 const client = require('prom-client');
 const winston = require('winston');
+const multer = require('multer');
+const fs = require('fs');
+const path = require('path');
+const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 
 // Initialize Express app
 const app = express();
@@ -88,6 +92,62 @@ let rabbitChannel;
     process.exit(1);
   }
 })();
+
+// MinIO Configuration
+const ENABLE_MINIO = process.env.ENABLE_MINIO === 'true';
+
+// S3/MinIO Client configuration (only if enabled)
+let s3Client = null;
+if (ENABLE_MINIO) {
+  try {
+    s3Client = new S3Client({
+      endpoint: process.env.S3_ENDPOINT || 'http://minio:9000',
+      region: process.env.S3_REGION || 'us-east-1',
+      credentials: {
+        accessKeyId: process.env.MINIO_ROOT_USER || 'admin',
+        secretAccessKey: process.env.MINIO_ROOT_PASSWORD || 'admin123456'
+      },
+      forcePathStyle: true  // Required for MinIO
+    });
+    logger.info(`✅ MinIO S3 client initialized (endpoint: ${process.env.S3_ENDPOINT || 'http://minio:9000'})`);
+  } catch (error) {
+    logger.error(`❌ Failed to initialize MinIO S3 client: ${error.message}`);
+    logger.warn('Upload endpoint will be disabled');
+  }
+} else {
+  logger.info('ℹ️  MinIO disabled - upload endpoint will be disabled');
+}
+
+// Multer configuration for file uploads
+const upload = multer({
+  dest: '/tmp/uploads/',
+  limits: {
+    fileSize: 100 * 1024 * 1024  // 100MB max
+  },
+  fileFilter: (req, file, cb) => {
+    const allowedMimes = [
+      'audio/mpeg',
+      'audio/wav',
+      'audio/x-wav',  // Alternative WAV MIME type
+      'audio/wave',   // Another WAV variant
+      'audio/mp4',
+      'audio/x-m4a',
+      'audio/ogg',
+      'audio/flac',
+      'application/octet-stream'  // Fallback for cases where MIME type isn't detected
+    ];
+
+    // Also check file extension as a fallback
+    const allowedExtensions = ['.mp3', '.wav', '.m4a', '.ogg', '.flac', '.mp4'];
+    const fileExtension = file.originalname.toLowerCase().match(/\.[^.]+$/)?.[0];
+
+    if (allowedMimes.includes(file.mimetype) || (fileExtension && allowedExtensions.includes(fileExtension))) {
+      cb(null, true);
+    } else {
+      cb(new Error(`Invalid file type: ${file.mimetype} (${file.originalname}). Only audio files are allowed.`));
+    }
+  }
+});
 
 // Middleware
 app.use(helmet());
@@ -318,11 +378,82 @@ app.get('/api/v1/tasks/:id', async (req, res) => {
   }
 });
 
+// File upload endpoint (only available if MinIO is enabled)
+app.post('/api/v1/upload', upload.single('audio'), async (req, res) => {
+  // Check if MinIO is enabled
+  if (!ENABLE_MINIO || !s3Client) {
+    return res.status(503).json({
+      success: false,
+      error: 'File upload is disabled. MinIO is not enabled.',
+      hint: 'Set ENABLE_MINIO=true to enable file uploads'
+    });
+  }
+
+  try {
+    if (!req.file) {
+      return res.status(400).json({
+        success: false,
+        error: 'No audio file provided'
+      });
+    }
+
+    const file = req.file;
+    const timestamp = Date.now();
+    const fileKey = `audio/${timestamp}-${file.originalname}`;
+
+    // Read file content
+    const fileContent = fs.readFileSync(file.path);
+
+    // Upload to MinIO
+    await s3Client.send(new PutObjectCommand({
+      Bucket: 'audio-files',
+      Key: fileKey,
+      Body: fileContent,
+      ContentType: file.mimetype
+    }));
+
+    // Clean up temporary file
+    fs.unlinkSync(file.path);
+
+    // Generate URL (accessible from within Docker network)
+    const audioUrl = `http://minio:9000/audio-files/${fileKey}`;
+    const publicUrl = `http://localhost:9000/audio-files/${fileKey}`;
+
+    res.json({
+      success: true,
+      data: {
+        audio_url: audioUrl,        // For internal use
+        public_url: publicUrl,      // For external access
+        file_key: fileKey,
+        size: file.size,
+        mimetype: file.mimetype,
+        original_name: file.originalname
+      }
+    });
+
+    logger.info(`File uploaded: ${fileKey} (${file.size} bytes)`);
+
+  } catch (error) {
+    logger.error('File upload failed:', error);
+
+    // Clean up temp file if exists
+    if (req.file && req.file.path && fs.existsSync(req.file.path)) {
+      fs.unlinkSync(req.file.path);
+    }
+
+    res.status(500).json({
+      success: false,
+      error: 'File upload failed',
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
 // Task creation validation rules
 const createTaskValidation = [
   body('audio_url')
     .optional()
-    .isURL()
+    .isURL({ require_tld: false })  // Allow internal hostnames like "minio"
     .withMessage('audio_url must be a valid URL'),
   body('audio_duration')
     .optional()
